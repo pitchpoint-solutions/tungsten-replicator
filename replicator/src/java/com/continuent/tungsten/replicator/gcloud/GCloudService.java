@@ -21,6 +21,7 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.security.GeneralSecurityException;
+import java.util.Collections;
 
 public class GCloudService {
 
@@ -46,7 +47,8 @@ public class GCloudService {
             httpTransport = GoogleNetHttpTransport.newTrustedTransport();
             jsonFactory = JacksonFactory.getDefaultInstance();
             try (FileInputStream fileInputStream = new FileInputStream(serviceAccountCredentialsFile)) {
-                credential = GoogleCredential.fromStream(fileInputStream, httpTransport, jsonFactory);
+                credential = GoogleCredential.fromStream(fileInputStream, httpTransport, jsonFactory)
+                        .createScoped(Collections.singletonList("https://www.googleapis.com/auth/pubsub"));
             }
             httpRequestFactory = httpTransport.createRequestFactory(credential);
         } catch (IOException | GeneralSecurityException e) {
