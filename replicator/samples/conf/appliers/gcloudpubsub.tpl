@@ -2,6 +2,9 @@
 replicator.applier.dbms=com.continuent.tungsten.replicator.applier.GCloudPubSubApplier
 replicator.applier.dbms.topicUrl=https://pubsub.googleapis.com/v1/{topic}:publish
 replicator.applier.dbms.credentialsFile=@{HOME_DIRECTORY}/.gcloud/credentials.json
+replicator.applier.dbms.publicKeyFile=
+replicator.applier.dbms.publicKeyId=
+replicator.applier.dbms.compress=true
 replicator.applier.dbms.dataSource=global
 
 

@@ -25,28 +25,47 @@ import com.continuent.tungsten.replicator.plugin.PluginContext;
 import com.google.api.client.http.HttpHeaders;
 import com.google.api.client.http.HttpResponse;
 import com.google.api.client.util.Joiner;
+import com.google.api.client.util.PemReader;
+import com.google.common.base.Preconditions;
+import com.google.common.io.BaseEncoding;
 import com.google.common.net.MediaType;
+import org.apache.commons.lang.StringUtils;
 import org.apache.commons.lang.time.FastDateFormat;
 import org.apache.log4j.Logger;
+import org.bouncycastle.crypto.engines.AESEngine;
+import org.bouncycastle.crypto.io.CipherOutputStream;
+import org.bouncycastle.crypto.modes.GCMBlockCipher;
+import org.bouncycastle.crypto.params.AEADParameters;
+import org.bouncycastle.crypto.params.KeyParameter;
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.codehaus.jackson.map.ObjectMapper;
 import org.codehaus.jackson.node.ArrayNode;
 import org.codehaus.jackson.node.ObjectNode;
 
+import javax.crypto.Cipher;
+import java.io.ByteArrayOutputStream;
+import java.io.FileReader;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
+import java.security.KeyFactory;
+import java.security.PublicKey;
+import java.security.SecureRandom;
+import java.security.Security;
+import java.security.spec.X509EncodedKeySpec;
 import java.sql.Blob;
 import java.sql.Clob;
 import java.sql.SQLException;
 import java.sql.Time;
 import java.sql.Timestamp;
 import java.util.ArrayList;
-import java.util.Iterator;
+import java.util.Arrays;
 import java.util.List;
 import java.util.regex.Pattern;
+import java.util.zip.GZIPOutputStream;
 
 public class GCloudPubSubApplier implements RawApplier {
 
@@ -80,6 +99,16 @@ public class GCloudPubSubApplier implements RawApplier {
     private ArrayNode rowChangeData;
 
     private String directory;
+    private boolean compress = true;
+    private String publicKeyFile;
+    private String publicKeyId;
+    private SecureRandom secureRandom;
+    private PublicKey publicKey;
+    private byte[] nonce;
+    private String nonceAsString;
+    private static final String KEY_ENC_ALG = "RSA/ECB/PKCS1Padding";
+    private static final String DATA_ENC_ALG = "AES/GCM/NoPadding";
+
 
     public String getTopicUrl() {
         return topicUrl;
@@ -108,6 +137,30 @@ public class GCloudPubSubApplier implements RawApplier {
 
     public void setDirectory(String directory) {
         this.directory = directory;
+    }
+
+    public boolean isCompress() {
+        return compress;
+    }
+
+    public void setCompress(boolean compress) {
+        this.compress = compress;
+    }
+
+    public String getPublicKeyFile() {
+        return publicKeyFile;
+    }
+
+    public void setPublicKeyFile(String publicKeyFile) {
+        this.publicKeyFile = publicKeyFile;
+    }
+
+    public String getPublicKeyId() {
+        return publicKeyId;
+    }
+
+    public void setPublicKeyId(String publicKeyId) {
+        this.publicKeyId = publicKeyId;
     }
 
     /**
@@ -170,113 +223,73 @@ public class GCloudPubSubApplier implements RawApplier {
                     }
 
 
-                    if (action.equals(RowChangeData.ActionType.INSERT)) {
-                        // Fetch column names.
-                        List<ColumnSpec> colSpecs = orc.getColumnSpec();
+                    if (RowChangeData.ActionType.INSERT.equals(action)
+                            || RowChangeData.ActionType.UPDATE.equals(action)
+                            || RowChangeData.ActionType.DELETE.equals(action)) {
 
-                        // Make a document and insert for each row.
-                        Iterator<ArrayList<ColumnVal>> colValues = orc
-                                .getColumnValues().iterator();
-                        while (colValues.hasNext()) {
-                            ObjectNode doc = objectMapper.createObjectNode();
-                            ArrayList<ColumnVal> row = colValues.next();
-                            for (int i = 0; i < row.size(); i++) {
-                                Object value = row.get(i).getValue();
-                                setValue(doc, colSpecs.get(i), value);
-                            }
-                            if (logger.isDebugEnabled()) {
-                                logger.debug("Adding document: doc="
-                                        + doc.toString());
-                            }
-                            ObjectNode oneRowChangeJson = objectMapper.createObjectNode();
-                            oneRowChangeJson.put("database", orc.getSchemaName());
-                            oneRowChangeJson.put("table", orc.getTableName());
-                            oneRowChangeJson.put("ts", seqNo);
-                            oneRowChangeJson.put("type", action.toString());
-                            oneRowChangeJson.put("table_id", orc.getTableId());
-                            oneRowChangeJson.put("data", doc);
-                            rowChangeData.add(oneRowChangeJson);
-                        }
-                    } else if (action.equals(RowChangeData.ActionType.UPDATE)) {
+                        ArrayList<ColumnSpec> keySpecs = orc.getKeySpec();
+                        ArrayList<ArrayList<OneRowChange.ColumnVal>> keyValues = orc.getKeyValues();
 
-                        // Fetch key and column names.
-                        List<ColumnSpec> keySpecs = orc.getKeySpec();
-                        List<ColumnSpec> colSpecs = orc.getColumnSpec();
-                        ArrayList<ArrayList<OneRowChange.ColumnVal>> keyValues = orc
-                                .getKeyValues();
-                        ArrayList<ArrayList<OneRowChange.ColumnVal>> columnValues = orc
-                                .getColumnValues();
+                        ArrayNode keyRowColumnsJson = objectMapper.createArrayNode();
+                        for (ArrayList<OneRowChange.ColumnVal> key : keyValues) {
+                            int size = key.size();
+                            for (int i = 0; i < size; i++) {
+                                ColumnSpec spec = keySpecs.get(i);
+                                ColumnVal columnVal = key.get(i);
 
-                        // Iterate across the rows.
-                        for (int row = 0; row < columnValues.size()
-                                || row < keyValues.size(); row++) {
-                            List<ColumnVal> keyValuesOfRow = keyValues.get(row);
-                            List<ColumnVal> colValuesOfRow = columnValues
-                                    .get(row);
-
-                            // Prepare key values query to search for rows.
-                            ObjectNode old = objectMapper.createObjectNode();
-                            for (int i = 0; i < keyValuesOfRow.size(); i++) {
-                                setValue(old, keySpecs.get(i), keyValuesOfRow
-                                        .get(i).getValue());
-                            }
-
-                            ObjectNode doc = objectMapper.createObjectNode();
-                            for (int i = 0; i < colValuesOfRow.size(); i++) {
-                                setValue(doc, colSpecs.get(i), colValuesOfRow
-                                        .get(i).getValue());
-                            }
-                            if (logger.isDebugEnabled()) {
-                                logger.debug("Updating document: query="
-                                        + old + " doc=" + doc);
-                            }
-                            ObjectNode oneRowChangeJson = objectMapper.createObjectNode();
-                            oneRowChangeJson.put("database", orc.getSchemaName());
-                            oneRowChangeJson.put("table", orc.getTableName());
-                            oneRowChangeJson.put("ts", seqNo);
-                            oneRowChangeJson.put("type", action.toString());
-                            oneRowChangeJson.put("table_id", orc.getTableId());
-                            oneRowChangeJson.put("data", doc);
-                            oneRowChangeJson.put("old", old);
-                            rowChangeData.add(oneRowChangeJson);
-                            if (logger.isDebugEnabled()) {
-                                logger.debug("Documented updated: doc="
-                                        + doc);
+                                ObjectNode rowColumnJson = objectMapper.createObjectNode();
+                                rowColumnJson.put("index", spec.getIndex());
+                                rowColumnJson.put("length", spec.getLength());
+                                rowColumnJson.put("name", spec.getName());
+                                rowColumnJson.put("type", spec.getType());
+                                rowColumnJson.put("type_description", spec.getTypeDescription());
+                                rowColumnJson.put("is_blob", spec.isBlob());
+                                rowColumnJson.put("is_not_null", spec.isNotNull());
+                                rowColumnJson.put("is_unsigned", spec.isUnsigned());
+                                setValue(rowColumnJson, "value", columnVal.getValue());
+                                keyRowColumnsJson.add(rowColumnJson);
                             }
                         }
-                    } else if (action.equals(RowChangeData.ActionType.DELETE)) {
 
-                        List<ColumnSpec> keySpecs = orc.getKeySpec();
-                        ArrayList<ArrayList<OneRowChange.ColumnVal>> keyValues = orc
-                                .getKeyValues();
-                        ArrayList<ArrayList<OneRowChange.ColumnVal>> columnValues = orc
-                                .getColumnValues();
 
-                        // Iterate across the rows.
-                        for (int row = 0; row < columnValues.size()
-                                || row < keyValues.size(); row++) {
-                            List<ColumnVal> keyValuesOfRow = keyValues.get(row);
+                        ArrayList<ColumnSpec> colSpecs = orc.getColumnSpec();
+                        ArrayList<ArrayList<OneRowChange.ColumnVal>> columnValues = orc.getColumnValues();
 
-                            // Prepare key values query to search for rows.
-                            ObjectNode old = objectMapper.createObjectNode();
-                            for (int i = 0; i < keyValuesOfRow.size(); i++) {
-                                setValue(old, keySpecs.get(i), keyValuesOfRow
-                                        .get(i).getValue());
-                            }
+                        ArrayNode dataRowColumnsJson = objectMapper.createArrayNode();
+                        for (ArrayList<OneRowChange.ColumnVal> changes : columnValues) {
+                            int size = changes.size();
+                            for (int i = 0; i < size; i++) {
+                                ColumnSpec spec = colSpecs.get(i);
+                                ColumnVal columnVal = changes.get(i);
 
-                            ObjectNode oneRowChangeJson = objectMapper.createObjectNode();
-                            oneRowChangeJson.put("database", orc.getSchemaName());
-                            oneRowChangeJson.put("table", orc.getTableName());
-                            oneRowChangeJson.put("ts", seqNo);
-                            oneRowChangeJson.put("type", action.toString());
-                            oneRowChangeJson.put("table_id", orc.getTableId());
-                            oneRowChangeJson.put("old", old);
-                            rowChangeData.add(oneRowChangeJson);
-                            if (logger.isDebugEnabled()) {
-                                logger.debug("Deleting document: query="
-                                        + old);
+                                ObjectNode rowColumnJson = objectMapper.createObjectNode();
+                                rowColumnJson.put("index", spec.getIndex());
+                                rowColumnJson.put("length", spec.getLength());
+                                rowColumnJson.put("name", spec.getName());
+                                rowColumnJson.put("type", spec.getType());
+                                rowColumnJson.put("type_description", spec.getTypeDescription());
+                                rowColumnJson.put("is_blob", spec.isBlob());
+                                rowColumnJson.put("is_not_null", spec.isNotNull());
+                                rowColumnJson.put("is_unsigned", spec.isUnsigned());
+                                setValue(rowColumnJson, "value", columnVal.getValue());
+                                dataRowColumnsJson.add(rowColumnJson);
                             }
                         }
+
+                        ObjectNode oneRowChangeJson = objectMapper.createObjectNode();
+                        oneRowChangeJson.put("database_name", orc.getSchemaName());
+                        oneRowChangeJson.put("table_name", orc.getTableName());
+                        oneRowChangeJson.put("seq_no", seqNo);
+                        oneRowChangeJson.put("action", action.toString());
+                        oneRowChangeJson.put("table_id", orc.getTableId());
+                        oneRowChangeJson.put("key_data", keyRowColumnsJson);
+                        oneRowChangeJson.put("column_data", dataRowColumnsJson);
+                        rowChangeData.add(oneRowChangeJson);
+
+                        if (logger.isDebugEnabled()) {
+                            logger.debug("document: " + oneRowChangeJson);
+                        }
+
                     } else {
                         logger.warn("Unrecognized action type: " + action);
                         return;
@@ -323,9 +336,8 @@ public class GCloudPubSubApplier implements RawApplier {
         }
     }
 
-    private void setValue(ObjectNode doc, ColumnSpec columnSpec, Object value)
+    private void setValue(ObjectNode doc, String name, Object value)
             throws ReplicatorException {
-        String name = columnSpec.getName();
 
         if (value == null) {
             doc.putNull(name);
@@ -446,12 +458,57 @@ public class GCloudPubSubApplier implements RawApplier {
         try {
             ObjectNode root = objectMapper.createObjectNode();
 
+            ObjectNode attributesJson = objectMapper.createObjectNode();
+
+            byte[] data = objectMapper.writeValueAsBytes(rowChangeData);
+            if (compress) {
+                data = gzip(data);
+                attributesJson.put("compressed", "true");
+                attributesJson.put("compression_format", "gzip");
+            }
+
+            if (publicKeyFile != null) {
+                try {
+                    byte[] key = new byte[32];
+                    secureRandom.nextBytes(key);
+
+                    Cipher cipher = Cipher.getInstance(KEY_ENC_ALG, "BC");
+                    cipher.init(Cipher.ENCRYPT_MODE, publicKey);
+                    byte[] encryptedKey = cipher.doFinal(key);
+
+                    Arrays.fill(key, (byte) 0);
+
+                    GCMBlockCipher gcmBlockCipher = new GCMBlockCipher(new AESEngine());
+                    gcmBlockCipher.init(true, new AEADParameters(new KeyParameter(key), 128, nonce));
+
+                    ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
+                    try (CipherOutputStream cipherOutputStream = new CipherOutputStream(byteArrayOutputStream, gcmBlockCipher)) {
+                        cipherOutputStream.write(data);
+                    }
+
+                    data = byteArrayOutputStream.toByteArray();
+
+                    attributesJson.put("encrypted", "true");
+                    attributesJson.put("cipher_key_alg", KEY_ENC_ALG);
+                    attributesJson.put("cipher_key_id", publicKeyId);
+                    attributesJson.put("cipher_data_key", BaseEncoding.base64().encode(encryptedKey));
+                    attributesJson.put("cipher_data_iv", nonceAsString);
+                    attributesJson.put("cipher_data_alg", DATA_ENC_ALG);
+
+                } catch (Throwable e) {
+                    throw new ReplicatorException(
+                            "Unable to encrypt using RSA: pem=" + publicKeyFile, e);
+                }
+            }
+
             ObjectNode messageJson = objectMapper.createObjectNode();
-            messageJson.put("data", objectMapper.writeValueAsBytes(rowChangeData));
+            messageJson.put("data", data);
+            messageJson.put("attributes", attributesJson);
 
             ArrayNode messagesJson = objectMapper.createArrayNode();
             messagesJson.add(messageJson);
             root.put("messages", messagesJson);
+
 
             String toSend = objectMapper.writeValueAsString(root);
             if (logger.isDebugEnabled()) {
@@ -462,7 +519,7 @@ public class GCloudPubSubApplier implements RawApplier {
             int responseCode = response.getStatusCode();
             if (responseCode < 200 || responseCode >= 300) {
                 String dump = toString(response, entity);
-                throw new ReplicatorException(publishUri.toString() + " returned " + dump);
+                throw new ReplicatorException(publishUri.toString() + " request " + toSend + " returned " + dump);
             }
         } catch (Throwable e) {
             if (e instanceof ReplicatorException) {
@@ -535,6 +592,20 @@ public class GCloudPubSubApplier implements RawApplier {
                             + topicUrl
                             + ",credentials=" + credentialsFile, e);
         }
+
+        Security.addProvider(new BouncyCastleProvider());
+
+        if (!StringUtils.isBlank(publicKeyFile)) {
+            publicKey = loadPublicKey();
+            if (StringUtils.isBlank(publicKeyId)) {
+                throw new ReplicatorException(
+                        "Unable to initialize cipher. publicKeyId is required");
+            }
+            secureRandom = new SecureRandom();
+            nonce = new byte[32];
+            secureRandom.nextBytes(nonce);
+            nonceAsString = BaseEncoding.base64().encode(nonce);
+        }
     }
 
     @Override
@@ -571,5 +642,32 @@ public class GCloudPubSubApplier implements RawApplier {
         sb.append(response);
         sb.append("\r\n\r\nHttp Body Dump <<<<<\r\n");
         return sb.toString();
+    }
+
+    private byte[] gzip(byte[] data) {
+        ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
+        try (GZIPOutputStream gzipOutputStream = new GZIPOutputStream(byteArrayOutputStream)) {
+            gzipOutputStream.write(data);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        return byteArrayOutputStream.toByteArray();
+    }
+
+    private PublicKey loadPublicKey() throws ReplicatorException {
+        try {
+            try (FileReader reader = new FileReader(publicKeyFile)) {
+                PemReader pemReader = new PemReader(reader);
+                PemReader.Section section = pemReader.readNextSection("PUBLIC KEY");
+                Preconditions.checkNotNull(section, "PUBLIC KEY section not found in " + publicKeyFile);
+                byte[] bytes = section.getBase64DecodedBytes();
+                X509EncodedKeySpec keySpec = new X509EncodedKeySpec(bytes);
+                KeyFactory keyFactory = KeyFactory.getInstance("RSA");
+                return keyFactory.generatePublic(keySpec);
+            }
+        } catch (Throwable e) {
+            throw new ReplicatorException(
+                    "Unable to load pem: file=" + publicKeyFile, e);
+        }
     }
 }
